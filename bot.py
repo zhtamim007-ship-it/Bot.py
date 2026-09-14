@@ -1,9 +1,26 @@
 import os
 import requests
+from threading import Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# Render Environment Variables থেকে ডাটা রিড করা
+# Render-এর Port Check বাইপাস করার জন্য ডামি সার্ভার
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running successfully!")
+
+def start_dummy_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server.serve_forever()
+
+# আলাদা থ্রেডে পোর্ট লিসেনিং চালু করা
+Thread(target=start_dummy_server, daemon=True).start()
+
+# Render Environment Variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 REPO_OWNER = os.environ.get("REPO_OWNER")
@@ -21,7 +38,6 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "create_rdp":
         await query.edit_message_text("⌛ Setting up Cloud Node session... Please wait 1-2 mins.")
         
-        # GitHub Actions API Trigger
         url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/actions/workflows/rdp.yml/dispatches"
         headers = {
             "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -43,7 +59,7 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == '__main__':
     if not BOT_TOKEN:
-        print("CRITICAL ERROR: BOT_TOKEN is missing! Add BOT_TOKEN in Render Environment Variables.")
+        print("CRITICAL ERROR: BOT_TOKEN is missing!")
         exit(1)
         
     app = ApplicationBuilder().token(BOT_TOKEN).build()
