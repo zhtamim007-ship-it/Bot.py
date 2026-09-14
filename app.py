@@ -1,194 +1,214 @@
 import hmac
-import logging
 import os
-import re
 import threading
 
 import requests
-from flask import Flask, abort, jsonify, request
+from flask import Flask, request
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-OWNER_ID = int(os.environ["TELEGRAM_OWNER_ID"])
+# Values will be added in Render, not in this file.
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+OWNER_ID = int(os.environ["OWNER_TELEGRAM_ID"])
 WEBHOOK_SECRET = os.environ["TELEGRAM_WEBHOOK_SECRET"]
 
 GH_TOKEN = os.environ["GITHUB_TOKEN"]
-GH_REPO = os.environ["GITHUB_REPO"]
+GH_REPO = os.environ.get(
+    "GITHUB_REPO", "zhtamim007-ship-it/Bot.py"
+)
 GH_WORKFLOW = os.environ.get("GITHUB_WORKFLOW", "main.yml")
 GH_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 
+TG_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 GH_BASE = f"https://api.github.com/repos/{GH_REPO}"
 
-HEADERS = {
-    "Authorization": f"Bearer {GH_TOKEN}",
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
+# Run one Gunicorn worker in Render.
+lock = threading.Lock()
+processed = set()
+processed_order = []
+
+MENU = {
+    "inline_keyboard": [
+        [{"text": "▶ Start Session", "callback_data": "start"}],
+        [{"text": "📊 Check Status", "callback_data": "status"}],
+        [{"text": "⏹ Stop Session", "callback_data": "stop"}],
+        [{"text": "ℹ Help", "callback_data": "help"}],
+    ]
 }
 
-# Serializes commands within this single Render process.
-command_lock = threading.Lock()
-
-KEYBOARD = {
-    "keyboard": [
-        ["▶ Start", "📊 Status"],
-        ["⏹ Stop", "❓ Help"],
-    ],
-    "resize_keyboard": True,
+ACTIVE_STATES = {
+    "queued",
+    "in_progress",
+    "waiting",
+    "pending",
+    "requested",
 }
+
+
+def telegram(method, data):
+    response = requests.post(
+        f"{TG_BASE}/{method}", json=data, timeout=15
+    )
+    response.raise_for_status()
+    result = response.json()
+    if not result.get("ok"):
+        raise RuntimeError("Telegram request failed")
+    return result
+
+
+def send(text, keyboard=None):
+    return telegram(
+        "sendMessage",
+        {
+            "chat_id": OWNER_ID,
+            "text": text,
+            "reply_markup": keyboard or MENU,
+        },
+    )
 
 
 def github(method, path, **kwargs):
     response = requests.request(
         method,
-        GH_BASE + path,
-        headers=HEADERS,
-        timeout=10,
+        f"{GH_BASE}{path}",
+        headers={
+            "Authorization": f"Bearer {GH_TOKEN}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=15,
         **kwargs,
     )
-
-    if not response.ok:
-        # Do not expose API response bodies or tokens.
-        raise RuntimeError(
-            f"GitHub API returned HTTP {response.status_code}"
-        )
-
+    response.raise_for_status()
     if response.status_code == 204:
         return None
     return response.json()
 
 
-def workflow_runs():
-    data = github(
+def workflow_runs(page=1, size=100):
+    return github(
         "GET",
         f"/actions/workflows/{GH_WORKFLOW}/runs",
         params={
             "branch": GH_BRANCH,
             "event": "workflow_dispatch",
-            "per_page": 100,
+            "per_page": size,
+            "page": page,
         },
-    )
-
-    # Only recognize runs bearing our bot-specific run name.
-    return [
-        run
-        for run in data.get("workflow_runs", [])
-        if re.fullmatch(
-            r"telegram-session-\d+",
-            run.get("display_title", ""),
-        )
-    ]
+    )["workflow_runs"]
 
 
-def run_summary(run):
-    state = run.get("conclusion") or run.get("status")
-    return (
-        f"Run: {run['id']}\n"
-        f"State: {state}\n"
-        f"{run['html_url']}"
-    )
-
-
-def handle_command(text, update_id):
-    command = text.split()[0].split("@")[0] if text else ""
-
-    if text == "❓ Help" or command in ("/start", "/help"):
-        return (
-            "এই বট তোমার নির্দিষ্ট GitHub workflow নিয়ন্ত্রণ করে।\n\n"
-            "▶ Start — workflow শুরু\n"
-            "📊 Status — সর্বশেষ bot session\n"
-            "⏹ Stop — বন্ধ করার confirmation\n\n"
-            "Windows প্রস্তুত হলে workflow আলাদা message পাঠাবে।"
-        )
-
-    if text == "▶ Start" or command == "/run":
-        runs = workflow_runs()
-        title = f"telegram-session-{update_id}"
-
-        # Best-effort protection against Telegram delivery retries.
-        previous = next(
-            (run for run in runs
-             if run.get("display_title") == title),
-            None,
-        )
-        if previous:
-            return "এই অনুরোধ আগেই গ্রহণ করা হয়েছে।\n" + run_summary(previous)
-
-        active = [
+def active_runs():
+    found = []
+    page = 1
+    while True:
+        runs = workflow_runs(page)
+        found.extend(
             run for run in runs
-            if run["status"] != "completed"
-        ]
-        if active:
-            return "আগের session এখনও শেষ হয়নি।\n" + run_summary(active[0])
+            if run["status"] in ACTIVE_STATES
+        )
+        if len(runs) < 100:
+            return found
+        page += 1
+
+
+def handle(action):
+    if action == "start":
+        runs = active_runs()
+        if runs:
+            send(
+                "A workflow is already active.\n"
+                "Use Check Status or Stop Session."
+            )
+            return
 
         github(
             "POST",
             f"/actions/workflows/{GH_WORKFLOW}/dispatches",
-            json={
-                "ref": GH_BRANCH,
-                "inputs": {
-                    "request_id": str(update_id),
-                },
+            json={"ref": GH_BRANCH},
+        )
+        send(
+            "Start request accepted by GitHub.\n"
+            "This does not mean Windows is ready yet.\n"
+            "Wait a little, then press Check Status."
+        )
+
+    elif action == "status":
+        runs = workflow_runs(size=1)
+        if not runs:
+            send("No manually triggered workflow run found.")
+            return
+
+        run = runs[0]
+        send(
+            f"Latest workflow run: {run['id']}\n"
+            f"Status: {run['status']}\n"
+            f"Result: {run.get('conclusion') or 'Not finished'}\n\n"
+            f"{run['html_url']}\n\n"
+            "Workflow status is not an RDP connection test."
+        )
+
+    elif action == "stop":
+        runs = active_runs()
+        if not runs:
+            send("No active workflow found.")
+            return
+
+        # Show one exact run for confirmation.
+        run = runs[0]
+        send(
+            f"Cancel workflow run {run['id']}?\n"
+            "Its hosted runner session will end.\n"
+            "Unsaved data may be lost.\n\n"
+            f"{run['html_url']}",
+            {
+                "inline_keyboard": [
+                    [{
+                        "text": "Yes, stop this run",
+                        "callback_data": f"cancel:{run['id']}",
+                    }],
+                    [{
+                        "text": "No, go back",
+                        "callback_data": "menu",
+                    }],
+                ]
             },
         )
-        return (
-            "GitHub workflow request গ্রহণ করেছে।\n"
-            "এখনই Windows ready হয়েছে—এমন নয়।\n"
-            "কিছুক্ষণ পরে 📊 Status চাপো।"
+
+    elif action.startswith("cancel:"):
+        run_id = action.split(":", 1)[1]
+        if not run_id.isdigit():
+            send("Invalid request.")
+            return
+
+        # Verify that the selected run still belongs to
+        # this workflow/branch and is still active.
+        allowed = {
+            str(run["id"]): run for run in active_runs()
+        }
+        if run_id not in allowed:
+            send("That run is no longer active or is not in scope.")
+            return
+
+        github("POST", f"/actions/runs/{run_id}/cancel")
+        send(
+            "Cancellation requested.\n"
+            "Use Check Status to verify it has stopped.\n"
+            "This does not remove Tailscale device records."
         )
 
-    if text == "📊 Status" or command == "/status":
-        runs = workflow_runs()
-        if not runs:
-            return "এখনও কোনো bot session পাওয়া যায়নি।"
-        return run_summary(runs[0])
-
-    if text == "⏹ Stop" or command == "/stop":
-        runs = workflow_runs()
-        active = [
-            run for run in runs
-            if run["status"] != "completed"
-        ]
-        if not active:
-            return "কোনো active bot session পাওয়া যায়নি।"
-
-        run = active[0]
-        return (
-            "বন্ধ করলে unsaved কাজ হারাতে পারে।\n"
-            "নিশ্চিত হলে এই command পাঠাও:\n\n"
-            f"/confirm_stop {run['id']}\n\n"
-            + run_summary(run)
+    elif action == "help":
+        send(
+            "Start: request a workflow run.\n"
+            "Status: show the latest workflow run.\n"
+            "Stop: confirm cancellation of an active run.\n\n"
+            "Keep your phone signed in to your own Tailscale "
+            "account. Windows connection details will be "
+            "added in the workflow integration step."
         )
 
-    if command == "/confirm_stop":
-        parts = text.split()
-        if len(parts) != 2 or not parts[1].isdigit():
-            return "সঠিক format: /confirm_stop RUN_ID"
-
-        requested_id = int(parts[1])
-        runs = workflow_runs()
-        run = next(
-            (item for item in runs if item["id"] == requested_id),
-            None,
-        )
-
-        if not run:
-            return "এই ID বর্তমান bot workflow-এর তালিকায় নেই।"
-
-        if run["status"] == "completed":
-            return "Session ইতিমধ্যে শেষ হয়েছে।"
-
-        github(
-            "POST",
-            f"/actions/runs/{requested_id}/cancel",
-        )
-        return (
-            "Cancel request পাঠানো হয়েছে।\n"
-            "সম্পূর্ণ বন্ধ হয়েছে কি না 📊 Status দিয়ে যাচাই করো।"
-        )
-
-    return "নিচের বাটন ব্যবহার করো অথবা /help পাঠাও।"
+    else:
+        send("Your private workflow controller is ready.")
 
 
 @app.get("/")
@@ -197,47 +217,83 @@ def health():
 
 
 @app.post("/telegram")
-def telegram_webhook():
-    supplied = request.headers.get(
+def webhook():
+    provided = request.headers.get(
         "X-Telegram-Bot-Api-Secret-Token", ""
     )
-    if not hmac.compare_digest(supplied, WEBHOOK_SECRET):
-        abort(403)
+    if not hmac.compare_digest(provided, WEBHOOK_SECRET):
+        return "Forbidden", 403
 
-    update = request.get_json(silent=True) or {}
-    message = update.get("message") or {}
-    sender = message.get("from") or {}
-    chat = message.get("chat") or {}
+    update = request.get_json(silent=True)
+    if not isinstance(update, dict):
+        return "Bad request", 400
 
-    # Require a private message from the configured owner.
+    callback = update.get("callback_query")
+    message = (
+        callback.get("message", {})
+        if callback
+        else update.get("message", {})
+    )
+    sender = (
+        callback.get("from", {})
+        if callback
+        else message.get("from", {})
+    )
+    chat = message.get("chat", {})
+
     if (
         sender.get("id") != OWNER_ID
         or chat.get("id") != OWNER_ID
         or chat.get("type") != "private"
     ):
-        return jsonify(ok=True)
+        return "OK", 200
 
-    text = message.get("text", "").strip()
     update_id = update.get("update_id")
-    if not isinstance(update_id, int) or not text:
-        return jsonify(ok=True)
+    if not isinstance(update_id, int):
+        return "Bad request", 400
 
-    try:
-        with command_lock:
-            reply = handle_command(text, update_id)
-    except Exception:
-        # Avoid logging potentially sensitive request information.
-        app.logger.error("Command processing failed")
-        reply = (
-            "অনুরোধের ফল নিশ্চিত করা যায়নি। "
-            "আবার Start চাপার আগে Status দেখো। "
-            "GitHub permission, configuration ও availability যাচাই করো।"
-        )
+    with lock:
+        if update_id in processed:
+            return "OK", 200
 
-    # Telegram can execute a method returned in the webhook response.
-    return jsonify(
-        method="sendMessage",
-        chat_id=OWNER_ID,
-        text=reply,
-        reply_markup=KEYBOARD,
-    )
+        processed.add(update_id)
+        processed_order.append(update_id)
+        if len(processed_order) > 1000:
+            processed.discard(processed_order.pop(0))
+
+        if callback:
+            try:
+                telegram(
+                    "answerCallbackQuery",
+                    {"callback_query_id": callback["id"]},
+                )
+            except requests.RequestException:
+                pass
+            action = callback.get("data", "menu")
+        else:
+            commands = {
+                "/start": "menu",
+                "/status": "status",
+                "/stop": "stop",
+                "/help": "help",
+            }
+            action = commands.get(
+                message.get("text", "").strip(), "menu"
+            )
+
+        try:
+            handle(action)
+        except Exception:
+            # Do not print exception details containing credentials.
+            app.logger.warning("Bot operation failed")
+            try:
+                send(
+                    "Operation could not be confirmed.\n"
+                    "Check GitHub before retrying Start.\n"
+                    "Check Render environment settings as well."
+                )
+            except Exception:
+                app.logger.warning("Error notification failed")
+
+    return "OK", 200
+    
